@@ -243,3 +243,174 @@ test("index order matches compareValues for tricky strings and numbers", async (
   );
   expect(ids).toEqual(expected);
 });
+
+// Big indexes are split in blocks. Insert, move and delete enough docs to
+// split blocks and to empty whole blocks, and check every read against a
+// plain filter and sort over all docs.
+test("index reads stay right while index blocks split and empty", async () => {
+  const t = convexTest(schema);
+  const ids = new Set<Id<"messages">>();
+  const insert = async (ctx: any, count: number, make: (i: number) => any) => {
+    for (let i = 0; i < count; i++) {
+      ids.add(await ctx.db.insert("messages", make(i)));
+    }
+  };
+  await t.run((ctx) =>
+    insert(ctx, 2000, (i) => ({
+      author: `a${i % 4}`,
+      body: `b${i % 13}`,
+      score: i % 10 === 0 ? undefined : i % 97,
+    })),
+  );
+
+  const check = async (ctx: any) => {
+    const all: Doc<"messages">[] = (
+      await Promise.all([...ids].map((id) => ctx.db.get(id)))
+    ).filter((doc) => doc !== null);
+    const sorted = (fields: string[], docs: Doc<"messages">[]) =>
+      [...docs]
+        .sort((x: any, y: any) => {
+          for (const field of fields) {
+            const v = compareValues(x[field] as Value, y[field] as Value);
+            if (v !== 0) {
+              return v;
+            }
+          }
+          return 0;
+        })
+        .map((doc) => doc._id);
+    const read = async (query: any) =>
+      (await query.collect()).map((doc: Doc<"messages">) => doc._id);
+    const tail = ["_creationTime", "_id"];
+    expect(await read(ctx.db.query("messages"))).toEqual(sorted(tail, all));
+    for (const author of ["a0", "a1", "a2", "a3"]) {
+      const mine = all.filter((doc) => doc.author === author);
+      const byScore = sorted(["score", ...tail], mine);
+      expect(
+        await read(
+          ctx.db
+            .query("messages")
+            .withIndex("author_score", (q: any) => q.eq("author", author)),
+        ),
+      ).toEqual(byScore);
+      expect(
+        await read(
+          ctx.db
+            .query("messages")
+            .withIndex("author_score", (q: any) => q.eq("author", author))
+            .order("desc"),
+        ),
+      ).toEqual([...byScore].reverse());
+      expect(
+        await read(
+          ctx.db
+            .query("messages")
+            .withIndex("author_score", (q: any) =>
+              q.eq("author", author).gte("score", 20).lt("score", 60),
+            ),
+        ),
+      ).toEqual(
+        sorted(
+          ["score", ...tail],
+          mine.filter(
+            (doc) =>
+              doc.score !== undefined && doc.score >= 20 && doc.score < 60,
+          ),
+        ),
+      );
+      expect(
+        await read(
+          ctx.db
+            .query("messages")
+            .withIndex("author_body", (q: any) =>
+              q.eq("author", author).eq("body", "b5"),
+            ),
+        ),
+      ).toEqual(
+        sorted(
+          tail,
+          mine.filter((doc) => doc.body === "b5"),
+        ),
+      );
+      const first = await ctx.db
+        .query("messages")
+        .withIndex("author", (q: any) => q.eq("author", author))
+        .filter((q: any) => q.eq(q.field("body"), "b7"))
+        .first();
+      expect(first?._id ?? null).toEqual(
+        sorted(
+          tail,
+          mine.filter((doc) => doc.body === "b7"),
+        )[0] ?? null,
+      );
+    }
+  };
+
+  // Pages walk the same order as `collect`, also across blocks and with a
+  // cursor in desc order.
+  const checkPages = async () => {
+    for (const order of ["asc", "desc"] as const) {
+      const query = (ctx: any) =>
+        ctx.db
+          .query("messages")
+          .withIndex("author_score", (q: any) => q.eq("author", "a1"))
+          .order(order);
+      const expected = await t.run(async (ctx) =>
+        (await query(ctx).collect()).map((doc: Doc<"messages">) => doc._id),
+      );
+      const pages: Id<"messages">[] = [];
+      let cursor: string | null = null;
+      for (;;) {
+        const result: any = await t.run((ctx) =>
+          query(ctx).paginate({ cursor, numItems: 150 }),
+        );
+        pages.push(...result.page.map((doc: Doc<"messages">) => doc._id));
+        if (result.isDone) {
+          break;
+        }
+        cursor = result.continueCursor;
+      }
+      expect(pages).toEqual(expected);
+    }
+  };
+
+  // Build the indexes, so the next commits must update them.
+  await t.run(check);
+  await checkPages();
+  // New keys in the middle of the indexes split blocks.
+  await t.run((ctx) =>
+    insert(ctx, 1500, (i) => ({
+      author: "a1",
+      body: `b${i % 13}`,
+      score: 40 + (i % 7),
+    })),
+  );
+  await t.run(check);
+  await checkPages();
+  // Deleting every doc of one author empties whole blocks.
+  await t.run(async (ctx) => {
+    for (const doc of await ctx.db
+      .query("messages")
+      .withIndex("author", (q) => q.eq("author", "a2"))
+      .collect()) {
+      await ctx.db.delete(doc._id);
+      ids.delete(doc._id);
+    }
+  });
+  await t.run(check);
+  await checkPages();
+  // Moving docs to another author moves them across blocks.
+  await t.run(async (ctx) => {
+    for (const doc of await ctx.db
+      .query("messages")
+      .withIndex("author", (q) => q.eq("author", "a0"))
+      .collect()) {
+      await ctx.db.patch(doc._id, {
+        author: "a2",
+        score: (doc.score ?? 0) + 1,
+      });
+    }
+  });
+  await t.run(check);
+  await checkPages();
+});

@@ -128,11 +128,19 @@ type IndexEntry = {
 };
 
 // Entries sorted by key with `compareIndexKeys`, and the same entries by id.
+// The sorted entries are split in blocks, so a write moves the entries of one
+// block instead of the whole index. No block is empty.
 type SortedIndex = {
   keyReaders: Array<(document: GenericDocument) => Value | undefined>;
-  entries: IndexEntry[];
+  blocks: IndexEntry[][];
   byId: Map<DocumentId, IndexEntry>;
 };
+
+// A position in the blocks of a sorted index.
+type IndexPosition = { block: number; offset: number };
+
+// A block splits in two when it grows past twice this size.
+const INDEX_BLOCK_SIZE = 256;
 
 type QueryId = number;
 
@@ -754,38 +762,26 @@ class DatabaseFake {
     if (cursor === "_end_cursor") {
       return [][Symbol.iterator]();
     }
-    const { keyReaders, entries } = this._getIndex(
-      tableName,
-      indexName,
-      fields,
-    );
+    const { keyReaders, blocks } = this._getIndex(tableName, indexName, fields);
     const placeInRange = compileIndexRange(range);
-    let start = lowerBound(entries, (entry) => placeInRange(entry.key) >= 0);
-    let end = lowerBound(
-      entries,
-      (entry) => placeInRange(entry.key) > 0,
-      start,
-    );
     const cursorKeys = this._parseCursor(cursor);
-    if (cursorKeys !== null) {
-      if (order === "asc") {
-        start = Math.max(
-          start,
-          lowerBound(
-            entries,
-            (entry) => compareIndexKeys(entry.key, cursorKeys) > 0,
-          ),
-        );
-      } else {
-        end = Math.min(
-          end,
-          lowerBound(
-            entries,
-            (entry) => compareIndexKeys(entry.key, cursorKeys) >= 0,
-          ),
-        );
-      }
-    }
+    // The cursor moves the start of an asc read and the end of a desc read.
+    const start = seekIndex(
+      blocks,
+      (entry) =>
+        placeInRange(entry.key) >= 0 &&
+        (cursorKeys === null ||
+          order === "desc" ||
+          compareIndexKeys(entry.key, cursorKeys) > 0),
+    );
+    const end = seekIndex(
+      blocks,
+      (entry) =>
+        placeInRange(entry.key) > 0 ||
+        (cursorKeys !== null &&
+          order === "desc" &&
+          compareIndexKeys(entry.key, cursorKeys) >= 0),
+    );
 
     // Capture pending values now. Later writes must not change an open query.
     const writes = new Map<DocumentId, StoredDocument | null>();
@@ -812,12 +808,7 @@ class DatabaseFake {
     }
     pending.sort((a, b) => compareIndexKeys(a.key, b.key) * direction);
     const committed = (function* () {
-      for (
-        let position = direction === 1 ? start : end - 1;
-        position >= start && position < end;
-        position += direction
-      ) {
-        const entry = entries[position];
+      for (const entry of walkIndex(blocks, start, end, direction)) {
         if (!writes.has(entry.doc._id)) {
           yield entry;
         }
@@ -860,8 +851,12 @@ class DatabaseFake {
         entries.push({ key: keyReaders.map((read) => read(doc)), doc });
       }
       entries.sort((a, b) => compareIndexKeys(a.key, b.key));
+      const blocks: IndexEntry[][] = [];
+      for (let i = 0; i < entries.length; i += INDEX_BLOCK_SIZE) {
+        blocks.push(entries.slice(i, i + INDEX_BLOCK_SIZE));
+      }
       const byId = new Map(entries.map((entry) => [entry.doc._id, entry]));
-      index = { keyReaders, entries, byId };
+      index = { keyReaders, blocks, byId };
       tableIndexes.set(indexName, index);
     }
     return index;
@@ -877,7 +872,7 @@ class DatabaseFake {
     if (tableIndexes === undefined) {
       return;
     }
-    for (const { keyReaders, entries, byId } of tableIndexes.values()) {
+    for (const { keyReaders, blocks, byId } of tableIndexes.values()) {
       const newKey =
         newDoc === null ? null : keyReaders.map((read) => read(newDoc));
       if (oldDoc !== null) {
@@ -892,25 +887,38 @@ class DatabaseFake {
           entry.doc = newDoc!;
           continue;
         }
-        const i = lowerBound(
-          entries,
+        const { block, offset } = seekIndex(
+          blocks,
           (other) => compareIndexKeys(other.key, entry.key) >= 0,
         );
-        entries.splice(i, 1);
+        blocks[block].splice(offset, 1);
+        if (blocks[block].length === 0) {
+          blocks.splice(block, 1);
+        }
         byId.delete(oldDoc._id);
       }
       if (newKey !== null) {
         const entry = { key: newKey, doc: newDoc! };
-        const last = entries[entries.length - 1];
-        if (last === undefined || compareIndexKeys(last.key, newKey) < 0) {
+        const lastBlock = blocks[blocks.length - 1];
+        let position: IndexPosition;
+        if (lastBlock === undefined) {
+          blocks.push([]);
+          position = { block: 0, offset: 0 };
+        } else if (
+          compareIndexKeys(lastBlock[lastBlock.length - 1].key, newKey) < 0
+        ) {
           // New docs often sort last, for example by `_creationTime`.
-          entries.push(entry);
+          position = { block: blocks.length - 1, offset: lastBlock.length };
         } else {
-          const i = lowerBound(
-            entries,
+          position = seekIndex(
+            blocks,
             (other) => compareIndexKeys(other.key, newKey) >= 0,
           );
-          entries.splice(i, 0, entry);
+        }
+        const block = blocks[position.block];
+        block.splice(position.offset, 0, entry);
+        if (block.length > 2 * INDEX_BLOCK_SIZE) {
+          blocks.splice(position.block + 1, 0, block.splice(INDEX_BLOCK_SIZE));
         }
         byId.set(newDoc!._id, entry);
       }
@@ -1444,12 +1452,8 @@ function compileIndexRange(range: ReadonlyArray<SerializedRangeExpression>) {
 
 // The first position where `isAtOrAfter` is true. Along the items it must be
 // false first and then true.
-function lowerBound<T>(
-  items: T[],
-  isAtOrAfter: (item: T) => boolean,
-  start = 0,
-) {
-  let low = start;
+function lowerBound<T>(items: T[], isAtOrAfter: (item: T) => boolean) {
+  let low = 0;
   let high = items.length;
   while (low < high) {
     const middle = (low + high) >>> 1;
@@ -1460,6 +1464,56 @@ function lowerBound<T>(
     }
   }
   return low;
+}
+
+// The first position in the blocks where `isAtOrAfter` is true, or the end.
+// Along the entries it must be false first and then true.
+function seekIndex(
+  blocks: IndexEntry[][],
+  isAtOrAfter: (entry: IndexEntry) => boolean,
+): IndexPosition {
+  const block = lowerBound(blocks, (entries) =>
+    isAtOrAfter(entries[entries.length - 1]),
+  );
+  if (block === blocks.length) {
+    return { block, offset: 0 };
+  }
+  return { block, offset: lowerBound(blocks[block], isAtOrAfter) };
+}
+
+// The entries from `start` up to, not including, `end`: from the first one
+// for direction 1, from the last one for direction -1. Nothing when `start`
+// is not before `end`.
+function* walkIndex(
+  blocks: IndexEntry[][],
+  start: IndexPosition,
+  end: IndexPosition,
+  direction: 1 | -1,
+) {
+  if (direction === 1) {
+    let { block, offset } = start;
+    while (block < end.block || (block === end.block && offset < end.offset)) {
+      yield blocks[block][offset];
+      offset++;
+      if (offset === blocks[block].length) {
+        block++;
+        offset = 0;
+      }
+    }
+  } else {
+    let { block, offset } = end;
+    while (
+      block > start.block ||
+      (block === start.block && offset > start.offset)
+    ) {
+      if (offset === 0) {
+        block--;
+        offset = blocks[block].length;
+      }
+      offset--;
+      yield blocks[block][offset];
+    }
+  }
 }
 
 // Same result as `compareKeys`, with fast paths for equal values and plain
