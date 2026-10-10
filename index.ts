@@ -115,6 +115,19 @@ type VectorIndex = {
   filterFields: string[];
 };
 
+// The key has the values of the index fields. They end with `_id`, so every
+// key is unique.
+type IndexEntry = {
+  key: Array<Value | undefined>;
+  doc: StoredDocument;
+};
+
+// Entries sorted by key with `compareKeys`.
+type SortedIndex = {
+  keyReaders: Array<(document: GenericDocument) => Value | undefined>;
+  entries: IndexEntry[];
+};
+
 type QueryId = number;
 
 type TableName = string;
@@ -152,6 +165,8 @@ class DatabaseFake {
   private _documents: Record<DocumentId, StoredDocument> = {};
   // Committed ids per table, so a query reads only its own table instead of every document.
   private _tableIds: Map<TableName, Set<DocumentId>> = new Map();
+  // Sorted indexes of committed docs, per table and index name.
+  private _indexes: Map<TableName, Map<string, SortedIndex>> = new Map();
   private _storage: Record<DocumentId, Blob> = {};
   private _nextQueryId: QueryId = 1;
   private _nextDocId: number = 10000;
@@ -408,13 +423,14 @@ class DatabaseFake {
     for (const [id, write] of Object.entries(lastWrites)) {
       const _id = id as DocumentId;
       if (this._writes.length === 0) {
+        const tableName = tableNameFromId(_id)!;
+        const oldDoc = this._documents[_id] ?? null;
         if (write === null) {
           delete this._documents[_id];
-          this._tableIds.get(tableNameFromId(_id)!)?.delete(_id);
+          this._tableIds.get(tableName)?.delete(_id);
         } else {
           this._documents[_id] =
             commitTs === null ? write : resolveCommittedValues(write, commitTs);
-          const tableName = tableNameFromId(_id)!;
           let tableIds = this._tableIds.get(tableName);
           if (tableIds === undefined) {
             tableIds = new Set();
@@ -422,6 +438,7 @@ class DatabaseFake {
           }
           tableIds.add(_id);
         }
+        this._updateIndexes(tableName, oldDoc, this._documents[_id] ?? null);
       } else {
         this._addWrite(_id, write);
       }
@@ -683,6 +700,133 @@ class DatabaseFake {
     }
   }
 
+  // Reads an index range with binary search on the sorted index. The result
+  // is the same as a full table scan with the range filter, sorted by the
+  // index fields: same docs, same order.
+  private _readIndexRange(
+    tableName: string,
+    indexName: string,
+    fields: string[],
+    range: ReadonlyArray<SerializedRangeExpression>,
+    order: "asc" | "desc",
+  ) {
+    const { keyReaders, entries } = this._getIndex(
+      tableName,
+      indexName,
+      fields,
+    );
+    const placeInRange = compileIndexRange(range);
+    const start = lowerBound(entries, (entry) => placeInRange(entry.key) >= 0);
+    const end = lowerBound(
+      entries,
+      (entry) => placeInRange(entry.key) > 0,
+      start,
+    );
+    const results: GenericDocument[] = [];
+    const pendingIds = this._pendingIds(tableName);
+    if (pendingIds.size === 0) {
+      for (let i = start; i < end; i++) {
+        results.push(entries[i].doc);
+      }
+    } else {
+      // The index has only committed docs. A doc with a pending write may
+      // have changed, so skip its committed version and check its pending
+      // version with the range filter. Then merge both in key order.
+      const rangeFilters = range.map(compileRangeFilter);
+      const pending: IndexEntry[] = [];
+      for (const id of pendingIds) {
+        const doc = this.get(tableName, id);
+        if (doc !== null && rangeFilters.every((filter) => filter(doc))) {
+          pending.push({ key: keyReaders.map((read) => read(doc)), doc });
+        }
+      }
+      pending.sort((a, b) => compareKeys(a.key, b.key));
+      let p = 0;
+      for (let i = start; i < end; i++) {
+        const entry = entries[i];
+        if (pendingIds.has(entry.doc._id)) {
+          continue;
+        }
+        while (
+          p < pending.length &&
+          compareKeys(pending[p].key, entry.key) < 0
+        ) {
+          results.push(pending[p].doc);
+          p++;
+        }
+        results.push(entry.doc);
+      }
+      for (; p < pending.length; p++) {
+        results.push(pending[p].doc);
+      }
+    }
+    return order === "asc" ? results : results.reverse();
+  }
+
+  // The sorted index, built from the committed docs on first use. `commit`
+  // keeps it up to date.
+  private _getIndex(tableName: string, indexName: string, fields: string[]) {
+    let tableIndexes = this._indexes.get(tableName);
+    if (tableIndexes === undefined) {
+      tableIndexes = new Map();
+      this._indexes.set(tableName, tableIndexes);
+    }
+    let index = tableIndexes.get(indexName);
+    if (index === undefined) {
+      const keyReaders = fields.map(fieldReader);
+      const entries: IndexEntry[] = [];
+      for (const id of this._tableIds.get(tableName) ?? []) {
+        const doc = this._documents[id];
+        entries.push({ key: keyReaders.map((read) => read(doc)), doc });
+      }
+      entries.sort((a, b) => compareKeys(a.key, b.key));
+      index = { keyReaders, entries };
+      tableIndexes.set(indexName, index);
+    }
+    return index;
+  }
+
+  // Moves a committed doc in the indexes built so far for its table.
+  private _updateIndexes(
+    tableName: string,
+    oldDoc: StoredDocument | null,
+    newDoc: StoredDocument | null,
+  ) {
+    const tableIndexes = this._indexes.get(tableName);
+    if (tableIndexes === undefined) {
+      return;
+    }
+    for (const { keyReaders, entries } of tableIndexes.values()) {
+      const newKey =
+        newDoc === null ? null : keyReaders.map((read) => read(newDoc));
+      if (oldDoc !== null) {
+        const oldKey = keyReaders.map((read) => read(oldDoc));
+        const i = lowerBound(
+          entries,
+          (entry) => compareKeys(entry.key, oldKey) >= 0,
+        );
+        if (entries[i]?.doc !== oldDoc) {
+          throw new Error(
+            `convex-test index of table "${tableName}" is out of date`,
+          );
+        }
+        if (newKey !== null && compareKeys(oldKey, newKey) === 0) {
+          // Same key, so the entry keeps its place.
+          entries[i] = { key: newKey, doc: newDoc! };
+          continue;
+        }
+        entries.splice(i, 1);
+      }
+      if (newKey !== null) {
+        const i = lowerBound(
+          entries,
+          (entry) => compareKeys(entry.key, newKey) >= 0,
+        );
+        entries.splice(i, 0, { key: newKey, doc: newDoc! });
+      }
+    }
+  }
+
   // Ids of this table with a pending write in any open transaction level.
   private _pendingIds(tableName: string) {
     const ids = new Set<DocumentId>();
@@ -711,18 +855,24 @@ class DatabaseFake {
     order: "asc" | "desc";
   } {
     const source = query.source;
-    const results: GenericDocument[] = [];
+    let results: GenericDocument[] = [];
     let fieldPathsToSortBy: string[];
     let order: "asc" | "desc";
     switch (source.type) {
       case "FullTableScan": {
         const tableName = source.tableName;
-        this._iterateDocs(tableName, (doc) => {
-          results.push(doc);
-        });
         order = source.order ?? "asc";
         fieldPathsToSortBy = ["_creationTime"];
 
+        // No two docs of a table share a `_creationTime`, so the
+        // `by_creation_time` index has the same order.
+        results = this._readIndexRange(
+          tableName,
+          "by_creation_time",
+          ["_creationTime", "_id"],
+          [],
+          order,
+        );
         break;
       }
       case "IndexRange": {
@@ -751,12 +901,13 @@ class DatabaseFake {
 
         validateIndexRangeExpression(source, fields);
 
-        const rangeFilters = source.range.map(compileRangeFilter);
-        this._iterateDocs(tableName, (doc) => {
-          if (rangeFilters.every((filter) => filter(doc))) {
-            results.push(doc);
-          }
-        });
+        results = this._readIndexRange(
+          tableName,
+          indexName,
+          fields,
+          source.range,
+          order,
+        );
         break;
       }
       case "Search": {
@@ -768,6 +919,8 @@ class DatabaseFake {
             results.push(doc);
           }
         });
+        // Search results keep the table order, like before: there are no
+        // fields to sort by.
         fieldPathsToSortBy = [];
         order = "asc";
         break;
@@ -784,17 +937,6 @@ class DatabaseFake {
       query.operators.filter(
         (operator): operator is { limit: number } => "limit" in operator,
       )[0] ?? null;
-
-    // Read each sort key once, not in every comparison.
-    const orderMultiplier = order === "asc" ? 1 : -1;
-    const sortKeyReaders = fieldPathsToSortBy.map(fieldReader);
-    const sortKeys = new Map(
-      results.map((doc) => [doc, sortKeyReaders.map((read) => read(doc))]),
-    );
-    results.sort(
-      (a, b) =>
-        compareKeys(sortKeys.get(a)!, sortKeys.get(b)!) * orderMultiplier,
-    );
 
     const filterFn = (doc: GenericDocument) =>
       filters.every((f) => evaluateFilter(doc, f));
@@ -1107,6 +1249,73 @@ function compileRangeFilter(
     case "Lte":
       return (document) => compareValues(readField(document), value) <= 0;
   }
+}
+
+// Builds a function that places an index key against the range: -1 before
+// it, 0 inside it, 1 after it. The range is eq bounds on the first fields,
+// then optional gt/lt bounds on the next field, so the keys inside it are
+// next to each other in the sorted index.
+function compileIndexRange(range: ReadonlyArray<SerializedRangeExpression>) {
+  const bounds = range.map((expr) => ({
+    type: expr.type,
+    value: evaluateQueryValue(expr.value),
+  }));
+  return (key: ReadonlyArray<Value | undefined>) => {
+    // Eq bounds use the fields in order. Gt and lt use the field after them.
+    let field = 0;
+    for (const { type, value } of bounds) {
+      const v = compareValues(key[field], value);
+      switch (type) {
+        case "Eq":
+          if (v !== 0) {
+            return v < 0 ? -1 : 1;
+          }
+          field++;
+          break;
+        case "Gt":
+          if (v <= 0) {
+            return -1;
+          }
+          break;
+        case "Gte":
+          if (v < 0) {
+            return -1;
+          }
+          break;
+        case "Lt":
+          if (v >= 0) {
+            return 1;
+          }
+          break;
+        case "Lte":
+          if (v > 0) {
+            return 1;
+          }
+          break;
+      }
+    }
+    return 0;
+  };
+}
+
+// The first position where `isAtOrAfter` is true. Along the items it must be
+// false first and then true.
+function lowerBound<T>(
+  items: T[],
+  isAtOrAfter: (item: T) => boolean,
+  start = 0,
+) {
+  let low = start;
+  let high = items.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (isAtOrAfter(items[middle])) {
+      high = middle;
+    } else {
+      low = middle + 1;
+    }
+  }
+  return low;
 }
 
 // Compares two keys field by field with `compareValues`.
