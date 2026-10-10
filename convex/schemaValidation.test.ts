@@ -111,7 +111,7 @@ test("schema validation off", async () => {
 });
 
 // Valid values take a fast check that throws nothing. Invalid values must
-// still throw the same errors, also deep inside unions.
+// still throw the same errors as before, also deep inside nested unions.
 test("unions", async () => {
   const t = convexTest(
     defineSchema({
@@ -122,34 +122,83 @@ test("unions", async () => {
           v.null(),
           v.array(v.union(v.string(), v.int64())),
         ),
+        nested: v.optional(
+          v.union(
+            v.object({
+              kind: v.literal("a"),
+              inner: v.union(
+                v.literal("x"),
+                v.literal("y"),
+                v.object({ deep: v.union(v.number(), v.null()) }),
+              ),
+            }),
+            v.union(v.string(), v.array(v.union(v.boolean(), v.int64()))),
+          ),
+        ),
+        lit: v.optional(v.union(v.literal("p"), v.literal("q"), v.literal(3))),
       }),
     }),
   );
   await t.run(async (ctx) => {
-    for (const value of [
-      { kind: "a", n: 1 },
-      { kind: "b" },
-      { kind: "b", s: "x" },
-      null,
-      ["x", 2n],
+    for (const doc of [
+      { value: { kind: "a", n: 1 } },
+      { value: { kind: "b" } },
+      { value: { kind: "b", s: "x" } },
+      { value: null },
+      { value: ["x", 2n] },
+      { value: null, nested: { kind: "a", inner: "x" } },
+      { value: null, nested: { kind: "a", inner: { deep: null } } },
+      { value: null, nested: { kind: "a", inner: { deep: 2 } } },
+      { value: null, nested: "s" },
+      { value: null, nested: [true, 1n] },
+      { value: null, lit: "q" },
+      { value: null, lit: 3 },
     ]) {
-      await ctx.db.insert("messages", { value } as any);
+      await ctx.db.insert("messages", doc as any);
     }
   });
-  for (const value of [
-    { kind: "a", n: "1" },
-    { kind: "b", extra: 1 },
-    { kind: "c" },
-    [1],
-    "x",
-  ]) {
-    await expect(
-      async () =>
-        await t.run(async (ctx) => {
-          await ctx.db.insert("messages", { value } as any);
-        }),
-    ).rejects.toThrowError(
-      "Validator error: Expected one of object, object, null, array, got",
-    );
+  // The same texts as before the fast check was added.
+  const top =
+    "Validator error: Expected one of object, object, null, array, got";
+  const nested = "Validator error: Expected one of object, union, got";
+  const lit = "Validator error: Expected one of literal, literal, literal, got";
+  for (const [doc, message] of [
+    [{ value: { kind: "a", n: "1" } }, `${top} \`{"kind":"a","n":"1"}\``],
+    [{ value: { kind: "b", extra: 1 } }, `${top} \`{"extra":1,"kind":"b"}\``],
+    [{ value: { kind: "c" } }, `${top} \`{"kind":"c"}\``],
+    [{ value: [1] }, `${top} \`[1]\``],
+    [{ value: "x" }, `${top} \`"x"\``],
+    [{}, "Validator error: Missing required field `value` in object"],
+    [
+      { value: null, nested: { kind: "a", inner: "z" } },
+      `${nested} \`{"inner":"z","kind":"a"}\``,
+    ],
+    [
+      { value: null, nested: { kind: "a", inner: { deep: "1" } } },
+      `${nested} \`{"inner":{"deep":"1"},"kind":"a"}\``,
+    ],
+    [
+      { value: null, nested: { kind: "a", inner: { deep: 1, more: 1 } } },
+      `${nested} \`{"inner":{"deep":1,"more":1},"kind":"a"}\``,
+    ],
+    [{ value: null, nested: { kind: "a" } }, `${nested} \`{"kind":"a"}\``],
+    [{ value: null, nested: [true, 1] }, `${nested} \`[true,1]\``],
+    [{ value: null, nested: 5 }, `${nested} \`5\``],
+    [{ value: null, lit: "r" }, `${lit} \`"r"\``],
+    [{ value: null, lit: "3" }, `${lit} \`"3"\``],
+    [
+      { value: null, other: 1 },
+      "Validator error: Unexpected field `other` in object",
+    ],
+  ] as const) {
+    let error: any = null;
+    try {
+      await t.run(async (ctx) => {
+        await ctx.db.insert("messages", doc as any);
+      });
+    } catch (e) {
+      error = e;
+    }
+    expect(error?.message).toEqual(message);
   }
 });
