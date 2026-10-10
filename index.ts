@@ -177,7 +177,8 @@ class DatabaseFake {
   private _nextQueryId: QueryId = 1;
   private _nextDocId: number = 10000;
   private _lastCreationTime: number = 0;
-  private _queryResults: Record<QueryId, Array<GenericDocument>> = {};
+  private _queryResults: Record<QueryId, IterableIterator<GenericDocument>> =
+    {};
   // Pending writes for each level of transaction nesting.
   // Whenever a child mutation begins, a new level is created for all
   // components.
@@ -495,11 +496,23 @@ class DatabaseFake {
     if (results === undefined) {
       throw new Error("Bad queryId");
     }
-    if (results.length === 0) {
-      return { value: null, done: true };
-    } else {
-      return { value: results.shift()!, done: false };
+    const { value, done } = results.next();
+    if (done) {
+      this.endQuery(queryId);
     }
+    return { value: done ? null : value, done };
+  }
+
+  endQuery(queryId: QueryId) {
+    delete this._queryResults[queryId];
+  }
+
+  private _parseCursor(cursor: string | null | undefined) {
+    return cursor
+      ? (JSON.parse(cursor) as Array<string | null>).map((key) =>
+          key === null ? undefined : jsonToConvex(JSON.parse(key)),
+        )
+      : null;
   }
 
   private _encodeCursor(doc: GenericDocument, fieldPaths: string[]): string {
@@ -545,26 +558,18 @@ class DatabaseFake {
     maximumRowsRead?: number | null;
     maximumBytesRead?: number | null;
   }) {
-    const { sortedDocs, filterFn, fieldPathsToSortBy, order } =
-      this._resolveQuerySource(query);
+    const { docs, filterFn, fieldPathsToSortBy, order } =
+      this._resolveQuerySource(query, cursor);
 
     // Always include _id in sort key fields for uniqueness
     const cursorFields = fieldPathsToSortBy.includes("_id")
       ? fieldPathsToSortBy
       : [...fieldPathsToSortBy, "_id"];
 
-    const parseCursor = (c: string | null | undefined) => {
-      if (!c) return null;
-      // null = undefined field; strings are JSON.stringify(convexToJson(v))
-      return (JSON.parse(c) as any[]).map((k) =>
-        k === null ? undefined : jsonToConvex(JSON.parse(k)),
-      );
-    };
-
-    const cursorKeys = cursor !== "_end_cursor" ? parseCursor(cursor) : null;
+    const cursorKeys = cursor !== "_end_cursor" ? this._parseCursor(cursor) : null;
     // _end_cursor as endCursor means "to the end of the range" — no boundary
     const hasEndBoundary = !!endCursor && endCursor !== "_end_cursor";
-    const endCursorKeys = hasEndBoundary ? parseCursor(endCursor) : null;
+    const endCursorKeys = hasEndBoundary ? this._parseCursor(endCursor) : null;
 
     const page: GenericDocument[] = [];
     // null cursor = start of range
@@ -577,9 +582,12 @@ class DatabaseFake {
     let bytesRead = 0;
     const readDocCursors: string[] = [];
 
-    for (let i = 0; i < sortedDocs.length; i++) {
-      const doc = sortedDocs[i];
-      const isLastDoc = i === sortedDocs.length - 1;
+    let next = docs.next();
+    while (!next.done) {
+      const doc = next.value;
+      // One source row ahead preserves the existing last-page and filter rules.
+      next = docs.next();
+      const isLastDoc = next.done;
 
       if (!isInPage) {
         if (cursor === "_end_cursor") {
@@ -734,67 +742,105 @@ class DatabaseFake {
     return results;
   }
 
-  // Reads an index range with binary search on the sorted index. The result
-  // is the same as a full table scan with the range filter, sorted by the
-  // index fields: same docs, same order.
+  // Seeks the range and cursor, then yields docs in index order.
   private _readIndexRange(
     tableName: string,
     indexName: string,
     fields: string[],
     range: ReadonlyArray<SerializedRangeExpression>,
     order: "asc" | "desc",
+    cursor: string | null = null,
   ) {
+    if (cursor === "_end_cursor") {
+      return [][Symbol.iterator]();
+    }
     const { keyReaders, entries } = this._getIndex(
       tableName,
       indexName,
       fields,
     );
     const placeInRange = compileIndexRange(range);
-    const start = lowerBound(entries, (entry) => placeInRange(entry.key) >= 0);
-    const end = lowerBound(
+    let start = lowerBound(entries, (entry) => placeInRange(entry.key) >= 0);
+    let end = lowerBound(
       entries,
       (entry) => placeInRange(entry.key) > 0,
       start,
     );
-    const results: GenericDocument[] = [];
-    const pendingIds = this._pendingIds(tableName);
-    if (pendingIds.size === 0) {
-      for (let i = start; i < end; i++) {
-        results.push(entries[i].doc);
-      }
-    } else {
-      // The index has only committed docs. A doc with a pending write may
-      // have changed, so skip its committed version and check its pending
-      // version with the range filter. Then merge both in key order.
-      const rangeFilters = range.map(compileRangeFilter);
-      const pending: IndexEntry[] = [];
-      for (const id of pendingIds) {
-        const doc = this.get(tableName, id);
-        if (doc !== null && rangeFilters.every((filter) => filter(doc))) {
-          pending.push({ key: keyReaders.map((read) => read(doc)), doc });
-        }
-      }
-      pending.sort((a, b) => compareIndexKeys(a.key, b.key));
-      let p = 0;
-      for (let i = start; i < end; i++) {
-        const entry = entries[i];
-        if (pendingIds.has(entry.doc._id)) {
-          continue;
-        }
-        while (
-          p < pending.length &&
-          compareIndexKeys(pending[p].key, entry.key) < 0
-        ) {
-          results.push(pending[p].doc);
-          p++;
-        }
-        results.push(entry.doc);
-      }
-      for (; p < pending.length; p++) {
-        results.push(pending[p].doc);
+    const cursorKeys = this._parseCursor(cursor);
+    if (cursorKeys !== null) {
+      if (order === "asc") {
+        start = Math.max(
+          start,
+          lowerBound(
+            entries,
+            (entry) => compareIndexKeys(entry.key, cursorKeys) > 0,
+          ),
+        );
+      } else {
+        end = Math.min(
+          end,
+          lowerBound(
+            entries,
+            (entry) => compareIndexKeys(entry.key, cursorKeys) >= 0,
+          ),
+        );
       }
     }
-    return order === "asc" ? results : results.reverse();
+
+    // Capture pending values now. Later writes must not change an open query.
+    const writes = new Map<DocumentId, StoredDocument | null>();
+    for (const layer of this._writes) {
+      for (const [id, doc] of Object.entries(layer)) {
+        if (tableNameFromId(id) === tableName) {
+          writes.set(id as DocumentId, doc);
+        }
+      }
+    }
+    const direction = order === "asc" ? 1 : -1;
+    const pending: IndexEntry[] = [];
+    for (const doc of writes.values()) {
+      if (doc !== null) {
+        const key = keyReaders.map((read) => read(doc));
+        if (
+          placeInRange(key) === 0 &&
+          (cursorKeys === null ||
+            compareIndexKeys(key, cursorKeys) * direction > 0)
+        ) {
+          pending.push({ key, doc });
+        }
+      }
+    }
+    pending.sort((a, b) => compareIndexKeys(a.key, b.key) * direction);
+    const committed = (function* () {
+      for (
+        let position = direction === 1 ? start : end - 1;
+        position >= start && position < end;
+        position += direction
+      ) {
+        const entry = entries[position];
+        if (!writes.has(entry.doc._id)) {
+          yield entry;
+        }
+      }
+    })();
+    return (function* () {
+      let saved = committed.next();
+      let position = 0;
+      while (!saved.done || position < pending.length) {
+        if (
+          !saved.done &&
+          (position === pending.length ||
+            compareIndexKeys(saved.value.key, pending[position].key) *
+              direction <=
+              0)
+        ) {
+          yield saved.value.doc;
+          saved = committed.next();
+        } else {
+          yield pending[position++].doc;
+        }
+      }
+    })();
   }
 
   // The sorted index, built from the committed docs on first use. `commit`
@@ -885,14 +931,16 @@ class DatabaseFake {
   }
 
   /**
-   * Resolves the query source: loads documents matching the source (table scan,
-   * index range, or search), sorts them, and returns along with the compiled
-   * operator filter function. This separates "rows entering the pipeline"
-   * (sortedDocs) from "rows exiting" (after filterFn), which is needed for
+   * Resolves the ordered source and the compiled operator filter function.
+   * Index ranges seek directly. Search still builds its list.
+   * This separates source rows from rows after filterFn, which is needed for
    * maximumRowsRead tracking in paginate().
    */
-  private _resolveQuerySource(query: SerializedQuery): {
-    sortedDocs: GenericDocument[];
+  private _resolveQuerySource(
+    query: SerializedQuery,
+    cursor: string | null = null,
+  ): {
+    docs: IterableIterator<GenericDocument>;
     filterFn: (doc: GenericDocument) => boolean;
     limit: number | null;
     fieldPathsToSortBy: string[];
@@ -900,6 +948,7 @@ class DatabaseFake {
   } {
     const source = query.source;
     let results: GenericDocument[] = [];
+    let docs: IterableIterator<GenericDocument> | undefined;
     let fieldPathsToSortBy: string[];
     let order: "asc" | "desc";
     switch (source.type) {
@@ -910,19 +959,22 @@ class DatabaseFake {
 
         // No two docs of a table share a `_creationTime`, so the
         // `by_creation_time` index has the same order.
-        results = this._readIndexRange(
+        docs = this._readIndexRange(
           tableName,
           "by_creation_time",
           ["_creationTime", "_id"],
           [],
           order,
+          CHECK_INDEX ? null : cursor,
         );
         if (CHECK_INDEX) {
+          results = Array.from(docs);
           checkIndexRead(
             source,
             results,
             this._scanAndSort(tableName, [], fieldPathsToSortBy, order),
           );
+          docs = results[Symbol.iterator]();
         }
         break;
       }
@@ -952,19 +1004,22 @@ class DatabaseFake {
 
         validateIndexRangeExpression(source, fields);
 
-        results = this._readIndexRange(
+        docs = this._readIndexRange(
           tableName,
           indexName,
           fields,
           source.range,
           order,
+          CHECK_INDEX ? null : cursor,
         );
         if (CHECK_INDEX) {
+          results = Array.from(docs);
           checkIndexRead(
             source,
             results,
             this._scanAndSort(tableName, source.range, fields, order),
           );
+          docs = results[Symbol.iterator]();
         }
         break;
       }
@@ -1000,7 +1055,7 @@ class DatabaseFake {
       filters.every((f) => evaluateFilter(doc, f));
 
     return {
-      sortedDocs: results,
+      docs: docs ?? results[Symbol.iterator](),
       filterFn,
       limit: limit?.limit ?? null,
       fieldPathsToSortBy,
@@ -1008,13 +1063,22 @@ class DatabaseFake {
     };
   }
 
-  private _evaluateQuery(query: SerializedQuery): Array<GenericDocument> {
-    const { sortedDocs, filterFn, limit } = this._resolveQuerySource(query);
-    let results = sortedDocs.filter(filterFn);
-    if (limit !== null) {
-      results = results.slice(0, limit);
-    }
-    return results;
+  private _evaluateQuery(query: SerializedQuery) {
+    const { docs, filterFn, limit } = this._resolveQuerySource(query);
+    return (function* () {
+      let count = 0;
+      if (limit === 0) {
+        return;
+      }
+      for (const doc of docs) {
+        if (filterFn(doc)) {
+          yield doc;
+          if (limit !== null && ++count >= limit) {
+            return;
+          }
+        }
+      }
+    })();
   }
 
   vectorSearch(
@@ -1737,7 +1801,21 @@ function validateValidator(validator: ValidatorJSON, value: any) {
     }
     case "union": {
       let isValid = false;
+      const valueType = typeof value;
       for (const v of validator.value) {
+        // Reject simple mismatches without building errors the union discards.
+        if (
+          (v.type === "literal" && value !== v.value) ||
+          (v.type === "null" && value !== null) ||
+          ((v.type === "number" ||
+            v.type === "bigint" ||
+            v.type === "boolean" ||
+            v.type === "string") &&
+            valueType !== v.type) ||
+          (v.type === "id" && valueType !== "string")
+        ) {
+          continue;
+        }
         try {
           validateValidator(v, value);
           isValid = true;
@@ -1807,6 +1885,7 @@ function syscallImpl() {
         return JSON.stringify({ queryId });
       }
       case "1.0/queryCleanup": {
+        db.endQuery(args.queryId);
         return JSON.stringify({});
       }
       case "1.0/db/normalizeId": {
