@@ -617,7 +617,7 @@ class DatabaseFake {
           // At or past end cursor — include this doc if exactly at cursor, then stop
           if (cmp === 0) {
             rowsRead += 1;
-            bytesRead += getDocumentSize(doc);
+            bytesRead += docSize(doc);
             readDocCursors.push(this._encodeCursor(doc, cursorFields));
             if (filterFn(doc)) {
               page.push(doc);
@@ -629,7 +629,7 @@ class DatabaseFake {
       }
 
       rowsRead += 1;
-      bytesRead += getDocumentSize(doc);
+      bytesRead += docSize(doc);
       readDocCursors.push(this._encodeCursor(doc, cursorFields));
 
       // Check bandwidth limits
@@ -2130,6 +2130,29 @@ async function runScheduledFunction({
   );
 }
 
+// Stored docs never change: a write stores a new object. So the JSON text and
+// the size of a doc are computed once, not on every read of it.
+const docJsonCache = new WeakMap<GenericDocument, string>();
+const docSizeCache = new WeakMap<GenericDocument, number>();
+
+function docJson(doc: GenericDocument) {
+  let json = docJsonCache.get(doc);
+  if (json === undefined) {
+    json = JSON.stringify(convexToJson(doc));
+    docJsonCache.set(doc, json);
+  }
+  return json;
+}
+
+function docSize(doc: GenericDocument) {
+  let size = docSizeCache.get(doc);
+  if (size === undefined) {
+    size = getDocumentSize(doc);
+    docSizeCache.set(doc, size);
+  }
+  return size;
+}
+
 function asyncSyscallImpl() {
   return async (op: string, jsonArgs: string): Promise<string> => {
     const args = JSON.parse(jsonArgs);
@@ -2138,7 +2161,7 @@ function asyncSyscallImpl() {
     function getAndTrack(table: string, id: GenericId<string>) {
       const doc = db.get(table, id);
       if (doc !== null) {
-        tracker?.trackRead(getDocumentSize(doc));
+        tracker?.trackRead(docSize(doc));
       }
       return doc;
     }
@@ -2147,14 +2170,17 @@ function asyncSyscallImpl() {
         const { table, id } = args;
         tracker?.trackIndexRange();
         const doc = getAndTrack(table, id);
-        return JSON.stringify(convexToJson(doc));
+        return doc === null ? "null" : docJson(doc);
       }
       case "1.0/queryStreamNext": {
         const { value, done } = db.queryNext(args.queryId);
         if (!done && value !== null) {
-          tracker?.trackRead(getDocumentSize(value));
+          tracker?.trackRead(docSize(value));
         }
-        return JSON.stringify(convexToJson({ value, done }));
+        // Same text as `JSON.stringify(convexToJson({ value, done }))`.
+        return value === null
+          ? JSON.stringify({ value, done })
+          : `{"value":${docJson(value)},"done":${done}}`;
       }
       case "1.0/queryPage": {
         const {
@@ -2193,7 +2219,7 @@ function asyncSyscallImpl() {
         if (tracker) {
           tracker.trackIndexRange();
           for (const doc of page) {
-            tracker.trackRead(getDocumentSize(doc));
+            tracker.trackRead(docSize(doc));
           }
         }
         return JSON.stringify(
