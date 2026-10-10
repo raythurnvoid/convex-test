@@ -50,6 +50,11 @@ import {
 // table names or large numbers of documents, but this is the typical target.
 const TYPICAL_CONVEX_ID_LENGTH = 32;
 
+// Set CONVEX_TEST_CHECK_INDEX=1 to also run every index read as a full table
+// scan, and throw when the two results differ.
+const CHECK_INDEX =
+  typeof process !== "undefined" && process.env.CONVEX_TEST_CHECK_INDEX === "1";
+
 type FilterJson =
   | { $eq: [FilterJson, FilterJson] }
   | { $field: string }
@@ -700,6 +705,34 @@ class DatabaseFake {
     }
   }
 
+  // Reads every doc of the table, keeps the ones in the range and sorts them.
+  // This is the old query path. Check mode compares it with the index path.
+  private _scanAndSort(
+    tableName: string,
+    range: ReadonlyArray<SerializedRangeExpression>,
+    fieldPathsToSortBy: string[],
+    order: "asc" | "desc",
+  ) {
+    const rangeFilters = range.map(compileRangeFilter);
+    const results: GenericDocument[] = [];
+    this._iterateDocs(tableName, (doc) => {
+      if (rangeFilters.every((filter) => filter(doc))) {
+        results.push(doc);
+      }
+    });
+    // Read each sort key once, not in every comparison.
+    const orderMultiplier = order === "asc" ? 1 : -1;
+    const sortKeyReaders = fieldPathsToSortBy.map(fieldReader);
+    const sortKeys = new Map(
+      results.map((doc) => [doc, sortKeyReaders.map((read) => read(doc))]),
+    );
+    results.sort(
+      (a, b) =>
+        compareKeys(sortKeys.get(a)!, sortKeys.get(b)!) * orderMultiplier,
+    );
+    return results;
+  }
+
   // Reads an index range with binary search on the sorted index. The result
   // is the same as a full table scan with the range filter, sorted by the
   // index fields: same docs, same order.
@@ -873,6 +906,13 @@ class DatabaseFake {
           [],
           order,
         );
+        if (CHECK_INDEX) {
+          checkIndexRead(
+            source,
+            results,
+            this._scanAndSort(tableName, [], fieldPathsToSortBy, order),
+          );
+        }
         break;
       }
       case "IndexRange": {
@@ -908,6 +948,13 @@ class DatabaseFake {
           source.range,
           order,
         );
+        if (CHECK_INDEX) {
+          checkIndexRead(
+            source,
+            results,
+            this._scanAndSort(tableName, source.range, fields, order),
+          );
+        }
         break;
       }
       case "Search": {
@@ -1249,6 +1296,28 @@ function compileRangeFilter(
     case "Lte":
       return (document) => compareValues(readField(document), value) <= 0;
   }
+}
+
+// Throws when the index read and the full table scan return different docs
+// or a different order.
+function checkIndexRead(
+  source: Source,
+  indexDocs: GenericDocument[],
+  scanDocs: GenericDocument[],
+) {
+  if (
+    indexDocs.length === scanDocs.length &&
+    indexDocs.every((doc, i) => doc === scanDocs[i])
+  ) {
+    return;
+  }
+  const message =
+    `convex-test index check failed for ${JSON.stringify(source)}\n` +
+    `index: ${JSON.stringify(indexDocs.map((doc) => doc._id))}\n` +
+    `scan: ${JSON.stringify(scanDocs.map((doc) => doc._id))}`;
+  // Also log it, because the code that runs the query may catch the error.
+  console.error(message);
+  throw new Error(message);
 }
 
 // Builds a function that places an index key against the range: -1 before
