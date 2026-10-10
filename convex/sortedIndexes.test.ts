@@ -202,3 +202,44 @@ test("index reads match a filter and sort over all docs", async () => {
   // The same writes, now committed into the indexes.
   await t.run(check);
 });
+
+// Index keys use fast compares for strings and numbers. They must keep the
+// order of `compareValues`: UTF-8 bytes for strings, -0 before 0, and NaN.
+test("index order matches compareValues for tricky strings and numbers", async () => {
+  const t = convexTest(schema);
+  const authors = [
+    "",
+    "a",
+    "ab",
+    "b",
+    "é",
+    "\uffff",
+    "😀",
+    "😀a",
+    "\ue000",
+    "Z",
+  ];
+  const scores = [0, -0, 1, -1, 2.5, NaN, Infinity, -Infinity, undefined];
+  const expected = await t.run(async (ctx) => {
+    for (const author of authors) {
+      for (const score of scores) {
+        await ctx.db.insert("messages", { author, body: "x", score });
+      }
+    }
+    const all = await ctx.db.query("messages").collect();
+    return [...all]
+      .sort(
+        (x, y) =>
+          compareValues(x.author, y.author) ||
+          compareValues(x.score, y.score) ||
+          compareValues(x._creationTime, y._creationTime),
+      )
+      .map((doc) => doc._id);
+  });
+  const ids = await t.run(async (ctx) =>
+    (await ctx.db.query("messages").withIndex("author_score").collect()).map(
+      (doc) => doc._id,
+    ),
+  );
+  expect(ids).toEqual(expected);
+});
