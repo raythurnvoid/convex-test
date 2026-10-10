@@ -127,10 +127,11 @@ type IndexEntry = {
   doc: StoredDocument;
 };
 
-// Entries sorted by key with `compareKeys`.
+// Entries sorted by key with `compareIndexKeys`, and the same entries by id.
 type SortedIndex = {
   keyReaders: Array<(document: GenericDocument) => Value | undefined>;
   entries: IndexEntry[];
+  byId: Map<DocumentId, IndexEntry>;
 };
 
 type QueryId = number;
@@ -773,7 +774,7 @@ class DatabaseFake {
           pending.push({ key: keyReaders.map((read) => read(doc)), doc });
         }
       }
-      pending.sort((a, b) => compareKeys(a.key, b.key));
+      pending.sort((a, b) => compareIndexKeys(a.key, b.key));
       let p = 0;
       for (let i = start; i < end; i++) {
         const entry = entries[i];
@@ -782,7 +783,7 @@ class DatabaseFake {
         }
         while (
           p < pending.length &&
-          compareKeys(pending[p].key, entry.key) < 0
+          compareIndexKeys(pending[p].key, entry.key) < 0
         ) {
           results.push(pending[p].doc);
           p++;
@@ -812,8 +813,9 @@ class DatabaseFake {
         const doc = this._documents[id];
         entries.push({ key: keyReaders.map((read) => read(doc)), doc });
       }
-      entries.sort((a, b) => compareKeys(a.key, b.key));
-      index = { keyReaders, entries };
+      entries.sort((a, b) => compareIndexKeys(a.key, b.key));
+      const byId = new Map(entries.map((entry) => [entry.doc._id, entry]));
+      index = { keyReaders, entries, byId };
       tableIndexes.set(indexName, index);
     }
     return index;
@@ -829,33 +831,42 @@ class DatabaseFake {
     if (tableIndexes === undefined) {
       return;
     }
-    for (const { keyReaders, entries } of tableIndexes.values()) {
+    for (const { keyReaders, entries, byId } of tableIndexes.values()) {
       const newKey =
         newDoc === null ? null : keyReaders.map((read) => read(newDoc));
       if (oldDoc !== null) {
-        const oldKey = keyReaders.map((read) => read(oldDoc));
-        const i = lowerBound(
-          entries,
-          (entry) => compareKeys(entry.key, oldKey) >= 0,
-        );
-        if (entries[i]?.doc !== oldDoc) {
+        const entry = byId.get(oldDoc._id);
+        if (entry?.doc !== oldDoc) {
           throw new Error(
             `convex-test index of table "${tableName}" is out of date`,
           );
         }
-        if (newKey !== null && compareKeys(oldKey, newKey) === 0) {
+        if (newKey !== null && compareIndexKeys(entry.key, newKey) === 0) {
           // Same key, so the entry keeps its place.
-          entries[i] = { key: newKey, doc: newDoc! };
+          entry.doc = newDoc!;
           continue;
         }
-        entries.splice(i, 1);
-      }
-      if (newKey !== null) {
         const i = lowerBound(
           entries,
-          (entry) => compareKeys(entry.key, newKey) >= 0,
+          (other) => compareIndexKeys(other.key, entry.key) >= 0,
         );
-        entries.splice(i, 0, { key: newKey, doc: newDoc! });
+        entries.splice(i, 1);
+        byId.delete(oldDoc._id);
+      }
+      if (newKey !== null) {
+        const entry = { key: newKey, doc: newDoc! };
+        const last = entries[entries.length - 1];
+        if (last === undefined || compareIndexKeys(last.key, newKey) < 0) {
+          // New docs often sort last, for example by `_creationTime`.
+          entries.push(entry);
+        } else {
+          const i = lowerBound(
+            entries,
+            (other) => compareIndexKeys(other.key, newKey) >= 0,
+          );
+          entries.splice(i, 0, entry);
+        }
+        byId.set(newDoc!._id, entry);
       }
     }
   }
@@ -1385,6 +1396,65 @@ function lowerBound<T>(
     }
   }
   return low;
+}
+
+// Same result as `compareKeys`, with fast paths for equal values and plain
+// numbers. The sorted indexes compare keys a lot, and `compareValues` is slow.
+function compareIndexKeys(
+  a: ReadonlyArray<Value | undefined>,
+  b: ReadonlyArray<Value | undefined>,
+) {
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x === y && typeof x !== "number") {
+      continue;
+    }
+    // `compareValues` orders -0 before 0 and has its own order for NaN.
+    if (
+      typeof x === "number" &&
+      typeof y === "number" &&
+      x !== 0 &&
+      y !== 0 &&
+      !Number.isNaN(x) &&
+      !Number.isNaN(y)
+    ) {
+      if (x !== y) {
+        return x < y ? -1 : 1;
+      }
+      continue;
+    }
+    if (typeof x === "string" && typeof y === "string") {
+      const v = compareStrings(x, y);
+      if (v !== 0) {
+        return v;
+      }
+      continue;
+    }
+    const v = compareValues(x, y);
+    if (v !== 0) {
+      return v;
+    }
+  }
+  return 0;
+}
+
+// Same sign as `compareValues` for two strings, which compares UTF-8 bytes.
+// UTF-16 units give the same order, except when a surrogate meets a unit in
+// U+E000..U+FFFF. Only that case goes to `compareValues`.
+function compareStrings(x: string, y: string) {
+  const length = Math.min(x.length, y.length);
+  for (let i = 0; i < length; i++) {
+    const a = x.charCodeAt(i);
+    const b = y.charCodeAt(i);
+    if (a !== b) {
+      if (a >= 0xd800 && b >= 0xd800) {
+        return compareValues(x, y);
+      }
+      return a < b ? -1 : 1;
+    }
+  }
+  return x.length - y.length;
 }
 
 // Compares two keys field by field with `compareValues`.
