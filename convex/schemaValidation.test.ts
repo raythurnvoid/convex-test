@@ -109,3 +109,47 @@ test("schema validation off", async () => {
     } as any);
   });
 });
+
+// Valid values take a fast check that throws nothing. Invalid values must
+// still throw the same errors, also deep inside unions.
+test("unions", async () => {
+  const t = convexTest(
+    defineSchema({
+      messages: defineTable({
+        value: v.union(
+          v.object({ kind: v.literal("a"), n: v.number() }),
+          v.object({ kind: v.literal("b"), s: v.optional(v.string()) }),
+          v.null(),
+          v.array(v.union(v.string(), v.int64())),
+        ),
+      }),
+    }),
+  );
+  await t.run(async (ctx) => {
+    for (const value of [
+      { kind: "a", n: 1 },
+      { kind: "b" },
+      { kind: "b", s: "x" },
+      null,
+      ["x", 2n],
+    ]) {
+      await ctx.db.insert("messages", { value } as any);
+    }
+  });
+  for (const value of [
+    { kind: "a", n: "1" },
+    { kind: "b", extra: 1 },
+    { kind: "c" },
+    [1],
+    "x",
+  ]) {
+    await expect(
+      async () =>
+        await t.run(async (ctx) => {
+          await ctx.db.insert("messages", { value } as any);
+        }),
+    ).rejects.toThrowError(
+      "Validator error: Expected one of object, object, null, array, got",
+    );
+  }
+});

@@ -1703,7 +1703,76 @@ type ValidatorJSON =
   | { type: "object"; value: Record<string, ObjectFieldType> }
   | { type: "union"; value: ValidatorJSON[] };
 
+// Same check as `validateValidator`, but returns false instead of throwing.
+// A union tries each member, and building an error for each member that does
+// not match is slow, so valid values are checked here first.
+function matchesValidator(validator: ValidatorJSON, value: any): boolean {
+  switch (validator.type) {
+    case "null":
+      return value === null;
+    case "number":
+      return typeof value === "number";
+    case "bigint":
+      return typeof value === "bigint";
+    case "commitTs":
+      return typeof value === "bigint" || value instanceof CommitTsPlaceholder;
+    case "boolean":
+      return typeof value === "boolean";
+    case "string":
+      return typeof value === "string";
+    case "bytes":
+      return value instanceof ArrayBuffer;
+    case "any":
+      return true;
+    case "literal":
+      return value === validator.value;
+    case "id":
+      return (
+        typeof value === "string" &&
+        tableNameFromId(value) === validator.tableName
+      );
+    case "array":
+      return (
+        Array.isArray(value) &&
+        value.every((v) => matchesValidator(validator.value, v))
+      );
+    case "union":
+      return validator.value.some((v) => matchesValidator(v, value));
+    case "object": {
+      // `isSimpleObject` throws for null.
+      if (typeof value !== "object" || value === null) {
+        return false;
+      }
+      if (!isSimpleObject(value)) {
+        return false;
+      }
+      for (const [k, { fieldType, optional }] of Object.entries(
+        validator.value,
+      )) {
+        if (value[k] === undefined) {
+          if (!optional) {
+            return false;
+          }
+        } else if (!matchesValidator(fieldType, value[k])) {
+          return false;
+        }
+      }
+      for (const k of Object.keys(value)) {
+        if (validator.value[k] === undefined) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }
+  // `validateValidator` does not check the other types either.
+  return true;
+}
+
 function validateValidator(validator: ValidatorJSON, value: any) {
+  if (matchesValidator(validator, value)) {
+    return;
+  }
   switch (validator.type) {
     case "null": {
       if (value !== null) {
