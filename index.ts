@@ -662,19 +662,38 @@ class DatabaseFake {
     tableName: string,
     callback: (doc: GenericDocument) => void,
   ) {
-    const isInTable = (id: string) => tableNameFromId(id) === tableName;
-    const ids = new Set<string>(this._tableIds.get(tableName));
-    for (let i = 0; i < this._writes.length; i++) {
-      for (const id of Object.keys(this._writes[i]).filter(isInTable)) {
-        ids.add(id);
+    const tableIds = this._tableIds.get(tableName) ?? new Set<DocumentId>();
+    const pendingIds = this._pendingIds(tableName);
+    if (pendingIds.size === 0) {
+      // No pending writes in this table, so the committed docs are current.
+      for (const id of tableIds) {
+        callback(this._documents[id]);
       }
+      return;
+    }
+    const ids = new Set<DocumentId>(tableIds);
+    for (const id of pendingIds) {
+      ids.add(id);
     }
     for (const id of ids) {
-      const document = this.get(tableName, id as DocumentId);
+      const document = this.get(tableName, id);
       if (document !== null) {
         callback(document);
       }
     }
+  }
+
+  // Ids of this table with a pending write in any open transaction level.
+  private _pendingIds(tableName: string) {
+    const ids = new Set<DocumentId>();
+    for (const writes of this._writes) {
+      for (const id of Object.keys(writes)) {
+        if (tableNameFromId(id) === tableName) {
+          ids.add(id as DocumentId);
+        }
+      }
+    }
+    return ids;
   }
 
   /**
@@ -732,10 +751,9 @@ class DatabaseFake {
 
         validateIndexRangeExpression(source, fields);
 
+        const rangeFilters = source.range.map(compileRangeFilter);
         this._iterateDocs(tableName, (doc) => {
-          if (
-            source.range.every((filter) => evaluateRangeFilter(doc, filter))
-          ) {
+          if (rangeFilters.every((filter) => filter(doc))) {
             results.push(doc);
           }
         });
@@ -767,17 +785,16 @@ class DatabaseFake {
         (operator): operator is { limit: number } => "limit" in operator,
       )[0] ?? null;
 
-    results.sort((a, b) => {
-      const orderMultiplier = order === "asc" ? 1 : -1;
-      let v = 0;
-      for (const fp of fieldPathsToSortBy) {
-        v = compareValues(evaluateFieldPath(fp, a), evaluateFieldPath(fp, b));
-        if (v !== 0) {
-          return v * orderMultiplier;
-        }
-      }
-      return v * orderMultiplier;
-    });
+    // Read each sort key once, not in every comparison.
+    const orderMultiplier = order === "asc" ? 1 : -1;
+    const sortKeyReaders = fieldPathsToSortBy.map(fieldReader);
+    const sortKeys = new Map(
+      results.map((doc) => [doc, sortKeyReaders.map((read) => read(doc))]),
+    );
+    results.sort(
+      (a, b) =>
+        compareKeys(sortKeys.get(a)!, sortKeys.get(b)!) * orderMultiplier,
+    );
 
     const filterFn = (doc: GenericDocument) =>
       filters.every((f) => evaluateFilter(doc, f));
@@ -1054,24 +1071,56 @@ function evaluateFilter(
   throw new Error(`not implemented: ${JSON.stringify(filter)}`);
 }
 
-function evaluateRangeFilter(
-  document: GenericDocument,
+// Same result as `evaluateFieldPath`, but a top-level field that holds a plain
+// value is read directly. Objects can hold commit ts placeholders, so they
+// still go through `evaluateFieldPath`.
+function fieldReader(
+  fieldPath: string,
+): (document: GenericDocument) => Value | undefined {
+  if (fieldPath.includes(".")) {
+    return (document) => evaluateFieldPath(fieldPath, document);
+  }
+  return (document) => {
+    const value = document[fieldPath];
+    return typeof value === "object" && value !== null
+      ? evaluateFieldPath(fieldPath, document)
+      : value;
+  };
+}
+
+// Prepares a range filter once per query, so the bound value is converted
+// once instead of once per document.
+function compileRangeFilter(
   expr: SerializedRangeExpression,
-) {
-  const result = evaluateFieldPath(expr.fieldPath, document);
+): (document: GenericDocument) => boolean {
+  const readField = fieldReader(expr.fieldPath);
   const value = evaluateQueryValue(expr.value);
   switch (expr.type) {
     case "Eq":
-      return compareValues(result, value) === 0;
+      return (document) => compareValues(readField(document), value) === 0;
     case "Gt":
-      return compareValues(result, value) > 0;
+      return (document) => compareValues(readField(document), value) > 0;
     case "Gte":
-      return compareValues(result, value) >= 0;
+      return (document) => compareValues(readField(document), value) >= 0;
     case "Lt":
-      return compareValues(result, value) < 0;
+      return (document) => compareValues(readField(document), value) < 0;
     case "Lte":
-      return compareValues(result, value) <= 0;
+      return (document) => compareValues(readField(document), value) <= 0;
   }
+}
+
+// Compares two keys field by field with `compareValues`.
+function compareKeys(
+  a: ReadonlyArray<Value | undefined>,
+  b: ReadonlyArray<Value | undefined>,
+) {
+  for (let i = 0; i < a.length; i++) {
+    const v = compareValues(a[i], b[i]);
+    if (v !== 0) {
+      return v;
+    }
+  }
+  return 0;
 }
 
 // A value used as a written field.
