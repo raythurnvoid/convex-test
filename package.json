@@ -11,7 +11,16 @@
   "homepage": "https://docs.convex.dev/functions/testing",
   "bugs": "https://github.com/get-convex/convex-test/issues",
   "repository": "https://github.com/get-convex/convex-test",
-  "main": "dist/index.js",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "module": "./index.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./index.ts",
+      "default": "./index.ts"
+    }
+  },
   "type": "module",
   "files": [
     "dist/*.js",
