@@ -328,11 +328,13 @@ class DatabaseFake {
     }
     delete value["_id"];
     delete value["_creationTime"];
-    const convexValue: any = {};
+    const merged = { ...fields };
     for (const [key, v] of Object.entries(value)) {
-      convexValue[key] = evaluateValue(v);
+      const field = evaluateValue(v);
+      // Patches remove fields before schema validation.
+      if (field === undefined) delete merged[key];
+      else merged[key] = field;
     }
-    const merged = { ...fields, ...convexValue };
     this._validate(tableNameFromId(_id as string)!, merged);
     this._addWrite(id, { _id, _creationTime, ...merged });
   }
@@ -574,7 +576,8 @@ class DatabaseFake {
       ? fieldPathsToSortBy
       : [...fieldPathsToSortBy, "_id"];
 
-    const cursorKeys = cursor !== "_end_cursor" ? this._parseCursor(cursor) : null;
+    const cursorKeys =
+      cursor !== "_end_cursor" ? this._parseCursor(cursor) : null;
     // _end_cursor as endCursor means "to the end of the range" — no boundary
     const hasEndBoundary = !!endCursor && endCursor !== "_end_cursor";
     const endCursorKeys = hasEndBoundary ? this._parseCursor(endCursor) : null;

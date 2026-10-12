@@ -32,6 +32,44 @@ test("patch", async () => {
   ).rejects.toThrowError("Validator error");
 });
 
+test("patch removes fields before validating a union", async () => {
+  const t = convexTest(
+    defineSchema({
+      messages: defineTable(
+        v.union(
+          v.object({ kind: v.literal("active"), view: v.string() }),
+          v.object({ kind: v.literal("idle") }),
+        ),
+      ),
+    }),
+  );
+  const id = await t.run((ctx) =>
+    ctx.db.insert("messages", { kind: "active", view: "before" }),
+  );
+  await expect(
+    t.run(async (ctx) => {
+      const patch = { kind: "idle" as const, view: undefined };
+      await ctx.db.patch("messages", id, patch);
+      return ctx.db.get("messages", id);
+    }),
+    "a union patch removes old fields before validation",
+  ).resolves.toMatchObject({ _id: id, kind: "idle" });
+  expect(await t.run((ctx) => ctx.db.get("messages", id))).not.toHaveProperty(
+    "view",
+  );
+  await t.run((ctx) =>
+    ctx.db.patch("messages", id, { kind: "active", view: "after" }),
+  );
+  await expect(
+    t.run((ctx) => ctx.db.patch("messages", id, { view: undefined })),
+  ).rejects.toThrowError("Validator error");
+  expect(await t.run((ctx) => ctx.db.get("messages", id))).toMatchObject({
+    _id: id,
+    kind: "active",
+    view: "after",
+  });
+});
+
 test("replace", async () => {
   const t = convexTest(schema);
   await expect(
